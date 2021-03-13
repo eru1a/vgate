@@ -3,10 +3,13 @@ package main
 import (
 	"bytes"
 	"encoding/base64"
-	"io/ioutil"
+	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
+	"strings"
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/gocarina/gocsv"
@@ -41,17 +44,24 @@ type App struct {
 	flex        *tview.Flex
 	serversView *ServersView
 	outputView  *tview.TextView
+	statusView  *tview.TextView
 	cmd         *exec.Cmd
 }
 
 func NewApp(servers []Server) *App {
-	flex := tview.NewFlex()
-	flex.SetDirection(tview.FlexRow)
 	serversView := NewServersView(servers)
+
 	outputView := tview.NewTextView()
 	outputView.SetTitle("output").SetTitleAlign(tview.AlignLeft).SetBorder(true)
+
+	statusView := tview.NewTextView()
+
+	flex := tview.NewFlex()
+	flex.SetDirection(tview.FlexRow)
+
 	flex.AddItem(serversView, 0, 1, true).
-		AddItem(outputView, 0, 1, false)
+		AddItem(outputView, 0, 1, false).
+		AddItem(statusView, 1, 1, false)
 
 	app := tview.NewApplication()
 	app.SetRoot(flex, true)
@@ -62,33 +72,23 @@ func NewApp(servers []Server) *App {
 		flex:        flex,
 		serversView: serversView,
 		outputView:  outputView,
+		statusView:  statusView,
 	}
 }
 
 func (a *App) setAction() {
 	a.serversView.SetSelectedFunc(func(row, column int) {
+		if os.Getegid() != 0 {
+			a.outputView.SetText("root required")
+			return
+		}
+
 		if row > len(a.servers) {
 			return
 		}
-		if a.cmd != nil {
-			a.cmd.Process.Kill()
-			a.cmd = nil
-			a.outputView.Clear()
-		}
 
-		server := a.servers[row-1]
+		a.Connect(a.servers[row-1])
 
-		cmd, err := ConnectCmd(server.OpenVPNConfigDataBase64)
-		if err != nil {
-			log.Fatal(err)
-		}
-		a.cmd = cmd
-		a.cmd.Stdout = a.outputView
-		a.cmd.Stderr = a.outputView
-
-		go func() {
-			a.cmd.Run()
-		}()
 	})
 
 	a.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
@@ -98,6 +98,9 @@ func (a *App) setAction() {
 			return nil
 		}
 		switch event.Rune() {
+		case 'x':
+			a.Disconnect()
+			return nil
 		case 'q':
 			a.Stop()
 			return nil
@@ -110,6 +113,39 @@ func (a *App) setAction() {
 	})
 }
 
+func (a *App) Connect(server Server) {
+	a.Disconnect()
+
+	cmd, err := ConnectCmd(server.OpenVPNConfigDataBase64)
+	if err != nil {
+		log.Fatal(err)
+	}
+	a.cmd = cmd
+	a.cmd.Stdout = a.outputView
+	a.cmd.Stderr = a.outputView
+
+	// TODO: `$curl inet-ip.info` 等で実際に確認する
+	a.statusView.SetText(fmt.Sprintf("connect to %s [x: disconnect]", server.IP))
+
+	go func() {
+		a.cmd.Run()
+	}()
+}
+
+func (a *App) Disconnect() {
+	if a.cmd != nil {
+		a.cmd.Process.Kill()
+		a.cmd = nil
+		a.outputView.Clear()
+		a.statusView.Clear()
+	}
+}
+
+func (a *App) Stop() {
+	a.Disconnect()
+	a.Application.Stop()
+}
+
 func (a *App) Run() {
 	defer os.Remove("/tmp/openvpnconf")
 
@@ -118,14 +154,6 @@ func (a *App) Run() {
 	if err := a.Application.Run(); err != nil {
 		log.Fatal(err)
 	}
-}
-
-func (a *App) Stop() {
-	if a.cmd != nil {
-		a.cmd.Process.Kill()
-		a.cmd = nil
-	}
-	a.Application.Stop()
 }
 
 type ServersView struct {
@@ -170,15 +198,19 @@ func NewServersView(servers []Server) *ServersView {
 
 func main() {
 	country := "JP"
+	if len(os.Args) > 1 {
+		country = os.Args[1]
+	}
 
-	allServers, err := getServers()
+	serversAll, err := getServers()
 	if err != nil {
 		panic(err)
 	}
 
 	var servers []Server
-	for _, server := range allServers {
-		if server.CountryShort == country {
+	for _, server := range serversAll {
+		switch {
+		case country == "ALL", strings.ToLower(country) == strings.ToLower(server.CountryShort):
 			servers = append(servers, server)
 		}
 	}
@@ -188,21 +220,21 @@ func main() {
 }
 
 func getServers() ([]Server, error) {
-	// res, err := http.Get(URL)
-	// if err != nil {
-	// 	panic(err)
-	// }
-	// defer res.Body.Close()
-	// b, err := io.ReadAll(res.Body)
-	// if err != nil {
-	// 	panic(err)
-	// }
-
-	// テスト用
-	b, err := ioutil.ReadFile("test.csv")
+	res, err := http.Get(URL)
 	if err != nil {
 		panic(err)
 	}
+	defer res.Body.Close()
+	b, err := io.ReadAll(res.Body)
+	if err != nil {
+		panic(err)
+	}
+
+	// // テスト用
+	// b, err := ioutil.ReadFile("test.csv")
+	// if err != nil {
+	// 	panic(err)
+	// }
 
 	b = bytes.TrimPrefix(b, []byte("*vpn_servers\r\n"))
 	b = bytes.TrimSuffix(b, []byte("*\r\n"))
@@ -232,7 +264,6 @@ func ConnectCmd(openVPNConfigDataBase64 string) (*exec.Cmd, error) {
 		return nil, err
 	}
 
-	// cmd := exec.Command("sudo", "openvpn", "/tmp/openvpnconf")
 	cmd := exec.Command("openvpn", "/tmp/openvpnconf")
 
 	return cmd, nil
